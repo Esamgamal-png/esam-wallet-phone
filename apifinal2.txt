@@ -1,0 +1,324 @@
+from fastapi import FastAPI, HTTPException  #يدون تشفير
+from contextlib import asynccontextmanager
+import cx_Oracle
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+import uvicorn
+import traceback
+
+# إعدادات الاتصال بقاعدة البيانات
+ORACLE_DSN = cx_Oracle.makedsn("localhost", 1521, service_name="Wallet_chat")
+ORACLE_USER = "Wallet_chat"
+ORACLE_PASSWORD = "Wallet_2025"
+
+def get_connection():
+    try:
+        return cx_Oracle.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=ORACLE_DSN)
+    except cx_Oracle.DatabaseError as e:
+        raise HTTPException(status_code=500, detail=f"Error connecting to Oracle: {e}")
+
+# نماذج البيانات
+class User(BaseModel):
+    username: str
+    password: str
+    role: str
+    active: bool = True
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class Message(BaseModel):
+    sender: str
+    receiver: str
+    text: str
+    timestamp: Optional[datetime] = None
+
+# تهيئة قاعدة البيانات
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🔄 بدء تهيئة قاعدة البيانات...")
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # إنشاء جدول users
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE TABLE users (
+                    id NUMBER PRIMARY KEY,
+                    username VARCHAR2(100) UNIQUE,
+                    password VARCHAR2(64),
+                    role VARCHAR2(20),
+                    active NUMBER(1) DEFAULT 1
+                )';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLCODE != -955 THEN RAISE; END IF;
+            END;
+        """)
+
+        # إنشاء sequence و trigger
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE SEQUENCE users_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLCODE != -955 THEN RAISE; END IF;
+            END;
+        """)
+
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE '
+                    CREATE OR REPLACE TRIGGER trg_users_id
+                    BEFORE INSERT ON users
+                    FOR EACH ROW
+                    WHEN (new.id IS NULL)
+                    BEGIN
+                        SELECT users_seq.NEXTVAL INTO :new.id FROM dual;
+                    END;
+                ';
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLCODE != -4080 THEN RAISE; END IF;
+            END;
+        """)
+
+        # باقي الجداول
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE SEQUENCE messages_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+            END;
+        """)
+
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE TABLE messages (
+                    id NUMBER PRIMARY KEY,
+                    sender VARCHAR2(100),
+                    receiver VARCHAR2(100),
+                    text CLOB,
+                    timestamp TIMESTAMP
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+            END;
+        """)
+
+        cursor.execute("""
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE TABLE last_seen_messages (
+                    user_msg VARCHAR2(100),
+                    contact VARCHAR2(100),
+                    last_seen TIMESTAMP,
+                    PRIMARY KEY (user_msg, contact)
+                )';
+            EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+            END;
+        """)
+
+        # إضافة مستخدمين افتراضيين
+        default_users = [('admin', 'admin123', 'admin'), ('moderator', 'mod123', 'moderator'), ('user1', 'user123', 'user')]
+        for username, password, role in default_users:
+            print(f"🚀 محاولة إضافة: username={username}, password={password}, role={role}")
+            cursor.execute("SELECT COUNT(*) FROM users WHERE username=:username", {'username': username})
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "INSERT INTO users (username, password, role, active) VALUES (:username, :password, :role, 1)",
+                    {'username': username, 'password': password, 'role': role}
+                )
+        conn.commit()
+        print("✅ قاعدة البيانات جاهزة.")
+    except Exception as e:
+        print("❌ فشل التهيئة:")
+        traceback.print_exc()
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+    yield
+    print("🛑 تم إيقاف التطبيق.")
+
+# إنشاء التطبيق
+app = FastAPI(lifespan=lifespan)
+
+# تسجيل الدخول
+@app.post("/login")
+def login(login_request: LoginRequest):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT username, password, role, active FROM users WHERE username=:username", 
+                      {'username': login_request.username})
+        user = cursor.fetchone()
+        
+        if not user:
+            raise HTTPException(status_code=401, detail="المستخدم غير موجود")
+        
+        username, password, role, active = user
+        if password != login_request.password:
+            raise HTTPException(status_code=401, detail="كلمة المرور خاطئة")
+        
+        if not active:
+            raise HTTPException(status_code=403, detail="المستخدم غير مفعل")
+            
+        return {
+            "username": username,
+            "role": role,
+            "active": bool(active)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+# المستخدمين
+@app.get("/users")
+def get_users():
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT username, role, active FROM users")
+        users = [{"username": row[0], "role": row[1], "active": bool(row[2])} for row in cursor.fetchall()]
+        return {"users": users}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/users")
+def create_user(user: User):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username=:username", {'username': user.username})
+        if cursor.fetchone()[0] > 0:
+            raise HTTPException(status_code=400, detail="اسم المستخدم موجود بالفعل")
+        cursor.execute(
+            "INSERT INTO users (username, password, role, active) VALUES (:username, :password, :role, :active)",
+            {
+                'username': user.username,
+                'password': user.password,
+                'role': user.role,
+                'active': 1 if user.active else 0
+            }
+        )
+        conn.commit()
+        return {"message": "تم إنشاء المستخدم بنجاح"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.put("/users/{username}")
+def update_user(username: str, user: User):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # التحقق من وجود المستخدم أولاً
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username=:username", {'username': username})
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+
+        # تحديث البيانات
+        cursor.execute("""
+            UPDATE users 
+            SET username=:new_username, 
+                password=:password, 
+                role=:role, 
+                active=:active 
+            WHERE username=:old_username
+        """, {
+            'new_username': user.username,
+            'password': user.password,
+            'role': user.role,
+            'active': 1 if user.active else 0,
+            'old_username': username
+        })
+        conn.commit()
+        return {"message": "تم تحديث المستخدم بنجاح"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/users/{username}")
+def delete_user(username: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # التحقق من وجود المستخدم أولاً
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username=:username", {'username': username})
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+
+        # حذف المستخدم
+        cursor.execute("DELETE FROM users WHERE username=:username", {'username': username})
+        conn.commit()
+        return {"message": "تم حذف المستخدم بنجاح"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+# الرسائل
+@app.get("/messages")
+def get_messages(sender: str, receiver: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT id, sender, receiver, text, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') 
+            FROM messages 
+            WHERE (sender = :sender AND receiver = :receiver) OR (sender = :receiver AND receiver = :sender)
+            ORDER BY timestamp ASC
+        """, {'sender': sender, 'receiver': receiver})
+        rows = cursor.fetchall()
+        messages = []
+        for row in rows:
+            messages.append({
+                "id": row[0],
+                "sender": row[1],
+                "receiver": row[2],
+                "text": str(row[3].read()) if hasattr(row[3], 'read') else str(row[3]),
+                "timestamp": row[4]
+            })
+        return {"messages": messages}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/messages")
+def send_message(message: Message):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO messages (id, sender, receiver, text, timestamp)
+            VALUES (messages_seq.NEXTVAL, :sender, :receiver, :text, SYSTIMESTAMP)
+        """, {
+            'sender': message.sender,
+            'receiver': message.receiver,
+            'text': message.text
+        })
+        conn.commit()
+        return {"message": "تم إرسال الرسالة"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+# تشغيل الخادم
+if __name__ == "__main__":
+    uvicorn.run(app, host="localhost", port=5000)
