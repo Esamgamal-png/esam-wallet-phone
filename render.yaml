@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: chat-api
+    env: python
+    startCommand: uvicorn apifinal2:app --host 0.0.0.0 --port 5000
+    plan: free
+    envVars:
+      - key: ORACLE_USER
+        value: Wallet_chat
+      - key: ORACLE_PASSWORD
+        value: Wallet_2025
+      - key: ORACLE_DSN
+        value: "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcps)(HOST=your-db-host)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=your_db_name))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
