@@ -22,7 +22,7 @@ from typing import List, Dict, Optional
 # ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 # ------------------------- إعدادات API -------------------------
-API_BASE_URL = "http://localhost:5000"
+API_BASE_URL = https://esam-wallet-phone-1.onrender.com
 
 def api_request(endpoint: str, method: str = "get", data: Optional[Dict] = None) -> Dict:
     """إرسال طلب إلى API"""
